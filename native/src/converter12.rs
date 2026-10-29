@@ -1208,6 +1208,67 @@ impl Converter12 {
         channel_order: u32,
         regions: &[Crop],
     ) -> windows::core::Result<Option<isize>> {
+        self.record_and_execute(d3d11_texture, source_id, scale, bias, channel_order, regions)?;
+        self.arm_gpu_wait()
+    }
+
+    /// `process_submit` without arming the event: the dispatch is submitted,
+    /// the fence signalled, and the value it reaches once the output is
+    /// complete returned. For a consumer on this device that orders its own
+    /// queue behind it (`TensorTransfer::transfer_submit_after`), so the CPU
+    /// waits once, for the consumer. Nothing is left to wait on here: if no
+    /// one waited, the next dispatch does (`record_and_execute`).
+    pub fn process_submit_unarmed(
+        &self,
+        d3d11_texture: &ID3D11Texture2D,
+        source_id: u64,
+        scale: f32,
+        bias: f32,
+        channel_order: u32,
+        regions: &[Crop],
+    ) -> windows::core::Result<u64> {
+        self.record_and_execute(d3d11_texture, source_id, scale, bias, channel_order, regions)?;
+        let value = self.fence_value.get() + 1;
+        unsafe { self.queue.Signal(&self.fence, value)? };
+        // Only after the Signal succeeded: a value never signalled would make
+        // the next `wait_idle` wait forever.
+        self.fence_value.set(value);
+        Ok(value)
+    }
+
+    /// The fence and the value of its last signal: what a queue on this
+    /// device waits for to read the output of the last dispatch.
+    pub(crate) fn fence(&self) -> (&ID3D12Fence, u64) {
+        (&self.fence, self.fence_value.get())
+    }
+
+    /// Block until the fence reaches its last signalled value; free when it
+    /// already has, as it has whenever the last dispatch was waited for.
+    fn wait_idle(&self) -> windows::core::Result<()> {
+        let value = self.fence_value.get();
+        unsafe {
+            if self.fence.GetCompletedValue() < value {
+                self.fence.SetEventOnCompletion(value, self.fence_event)?;
+                crate::wait_armed(Some(self.fence_event.0 as isize));
+            }
+        }
+        Ok(())
+    }
+
+    /// Record the dispatch and send it; no signal. The list, its allocator and
+    /// the regions buffer are reused, so the previous dispatch must be over:
+    /// after `process_submit_unarmed` only its consumer's wait says so, and a
+    /// consumer that failed between the two would leave it running.
+    fn record_and_execute(
+        &self,
+        d3d11_texture: &ID3D11Texture2D,
+        source_id: u64,
+        scale: f32,
+        bias: f32,
+        channel_order: u32,
+        regions: &[Crop],
+    ) -> windows::core::Result<()> {
+        self.wait_idle()?;
         if regions.len() > self.batch as usize {
             return Err(windows::core::Error::new(
                 windows::Win32::Foundation::E_INVALIDARG,
@@ -1374,7 +1435,7 @@ impl Converter12 {
             self.queue
                 .ExecuteCommandLists(&[Some(self.list.cast::<ID3D12CommandList>()?)]);
         }
-        self.arm_gpu_wait()
+        Ok(())
     }
 
     fn open_texture(
@@ -1463,6 +1524,7 @@ impl Converter12 {
     /// floats per call and turned this into an allocator benchmark.
     pub fn read_back(&self) -> windows::core::Result<Vec<u8>> {
         let count = self.output_byte_size() as usize;
+        self.wait_idle()?;
         unsafe {
             self.allocator.Reset()?;
             self.list.Reset(&self.allocator, None)?;

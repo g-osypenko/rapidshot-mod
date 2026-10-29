@@ -641,7 +641,10 @@ impl TensorTransfer {
     /// buffer never written is zeros rather than an error.
     ///
     /// Blocks until the copy is done, with the GIL released for the wait.
-    fn transfer(&self, py: Python<'_>, converter: &GpuConverter12) -> PyResult<()> {
+    /// `gpu_ordered=True` after `process(..., wait=False)`: the copy queue
+    /// waits for that dispatch on the GPU, and this is the only CPU wait.
+    #[pyo3(signature = (converter, *, gpu_ordered=false))]
+    fn transfer(&self, py: Python<'_>, converter: &GpuConverter12, gpu_ordered: bool) -> PyResult<()> {
         let event = {
             let inner = self
                 .inner
@@ -651,12 +654,40 @@ impl TensorTransfer {
                 .inner
                 .lock()
                 .map_err(|_| PyRuntimeError::new_err("converter lock poisoned"))?;
-            inner
-                .transfer_submit(&source)
-                .map_err(|e| PyRuntimeError::new_err(format!("tensor transfer failed: {e}")))?
+            if gpu_ordered {
+                inner.transfer_submit_after(&source)
+            } else {
+                inner.transfer_submit(&source)
+            }
+            .map_err(|e| PyRuntimeError::new_err(format!("tensor transfer failed: {e}")))?
         };
         wait_armed_detached(py, event);
         Ok(())
+    }
+
+    /// With every transfer, also copy these `(offset, length)` byte ranges of
+    /// the converter's output, back to back, to a CPU-readable buffer on the
+    /// source adapter; `probe()` returns them after the transfer. `[]` stops.
+    fn set_probe(&self, ranges: Vec<(u64, u64)>) -> PyResult<()> {
+        let inner = self
+            .inner
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("transfer lock poisoned"))?;
+        inner
+            .set_probe(&ranges)
+            .map_err(|e| PyValueError::new_err(format!("probe: {e}")))
+    }
+
+    /// The probe ranges of the last transfer, back to back (`set_probe`).
+    fn probe<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        let inner = self
+            .inner
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("transfer lock poisoned"))?;
+        let data = inner
+            .probe_bytes()
+            .map_err(|e| PyRuntimeError::new_err(format!("probe readback failed: {e}")))?;
+        Ok(PyBytes::new(py, &data))
     }
 
     /// Destination-side bytes. Verification only.
@@ -839,8 +870,12 @@ impl GpuConverter12 {
     /// regions run in one dispatch, into slots `0..len(regions)`.
     ///
     /// Blocks until the GPU is done, with the GIL released for the wait.
+    /// `wait=False` only submits: for `TensorTransfer.transfer(...,
+    /// gpu_ordered=True)` next, whose copy waits for this dispatch on the GPU
+    /// and whose wait is then the only one.
     #[pyo3(signature = (
-        texture_ptr, scale=1.0, bias=0.0, bgr=false, *, source_id=0, crop=None, regions=None
+        texture_ptr, scale=1.0, bias=0.0, bgr=false, *, source_id=0, crop=None, regions=None,
+        wait=true
     ))]
     #[allow(clippy::too_many_arguments)]
     fn process(
@@ -853,6 +888,7 @@ impl GpuConverter12 {
         source_id: u64,
         crop: Option<(u32, u32, u32, u32)>,
         regions: Option<Vec<(u32, u32, u32, u32)>>,
+        wait: bool,
     ) -> PyResult<()> {
         let inner = self
             .inner
@@ -879,18 +915,17 @@ impl GpuConverter12 {
             height,
         })
         .collect();
+        let channel_order = if bgr { 1 } else { 0 };
         let event = unsafe {
             with_texture(texture_ptr, |texture| {
-                inner
-                    .process_submit(
-                        texture,
-                        source_id,
-                        scale,
-                        bias,
-                        if bgr { 1 } else { 0 },
-                        &rects,
-                    )
-                    .map_err(|e| PyRuntimeError::new_err(format!("D3D12 dispatch failed: {e}")))
+                if wait {
+                    inner.process_submit(texture, source_id, scale, bias, channel_order, &rects)
+                } else {
+                    inner
+                        .process_submit_unarmed(texture, source_id, scale, bias, channel_order, &rects)
+                        .map(|_| None)
+                }
+                .map_err(|e| PyRuntimeError::new_err(format!("D3D12 dispatch failed: {e}")))
             })?
         };
         drop(inner);

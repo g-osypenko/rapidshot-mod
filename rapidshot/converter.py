@@ -559,14 +559,33 @@ class TensorTransfer:
         extra = {"queue_priority": int(queue_priority)} if queue_priority else {}
         self._impl = native.require_feature("TensorTransfer")(converter._impl, **extra)
 
-    def transfer(self) -> None:
+    def transfer(self, *, gpu_ordered: bool = False) -> None:
         """Copy the converter's current output across. Blocks until complete;
         other Python threads run while it waits.
 
         Call :meth:`GpuConverter.process` first: this moves whatever is in the
         buffer, and a buffer never written is zeros rather than an error.
+        ``gpu_ordered=True`` after ``process(frame, wait=False)``: the copy
+        queue waits for that dispatch on the GPU, so the CPU waits once, here,
+        for both. Without it such a copy could read a half-written output.
         """
-        self._impl.transfer(self._converter._impl)
+        if gpu_ordered:
+            self._impl.transfer(self._converter._impl, gpu_ordered=True)
+        else:
+            self._impl.transfer(self._converter._impl)
+
+    def set_probe(self, ranges: Sequence[Tuple[int, int]]) -> None:
+        """With every :meth:`transfer`, also copy these ``(offset, length)``
+        byte ranges of the converter's output, back to back, into a buffer the
+        CPU reads on the capture adapter -- :meth:`probe` returns them. A few
+        rows tell the CPU whether a frame repeats the last one without a trip
+        to the destination adapter. ``[]`` stops it."""
+        self._impl.set_probe([(int(offset), int(length)) for offset, length in ranges])
+
+    def probe(self) -> bytes:
+        """The :meth:`set_probe` ranges as the last :meth:`transfer` copied
+        them; ``b""`` without a probe."""
+        return bytes(self._impl.probe())
 
     def read_back_destination(self):
         """Destination-side bytes as a NumPy array. **Verification only.**"""
@@ -945,6 +964,7 @@ class GpuConverter:
         crop: Optional[Tuple[int, int, int, int]] = None,
         *,
         regions: Optional[Sequence[Tuple[int, int, int, int]]] = None,
+        wait: bool = True,
     ) -> GpuTensor:
         """Convert one frame and return a handle to the result.
 
@@ -956,6 +976,11 @@ class GpuConverter:
             regions: several crops, same coordinates, converted together in
                 one dispatch into slots ``0..len(regions)``. At most ``batch``;
                 not combinable with ``crop``.
+            wait: ``False`` only submits the dispatch, for
+                ``TensorTransfer.transfer(gpu_ordered=True)`` right after: its
+                copy waits for the dispatch on the GPU, and its wait is the
+                only one. Keep the frame until that wait is over -- the GPU
+                may still be reading it.
 
         The returned :class:`GpuTensor` is the *same object* every call while
         you hold it — it describes a buffer that is reused, so holding two of
@@ -1004,7 +1029,10 @@ class GpuConverter:
         # that costs a multiply.
         scale = 1.0 if self._normalize else 255.0
         # The texture address alone is not an identity (COM addresses get
-        # recycled), so the frame's source_id goes with it.
+        # recycled), so the frame's source_id goes with it. ``wait`` reaches
+        # the native layer only when False, so an older build still loads.
+        if not wait:
+            native_args["wait"] = False
         self._impl.process(
             native._texture_address(frame),
             scale,

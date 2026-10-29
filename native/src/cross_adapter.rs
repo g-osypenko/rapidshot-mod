@@ -730,6 +730,19 @@ impl Submitter {
         self.signal_and_arm_after_execute()
     }
 
+    /// `end_and_arm`, with the queue first waiting on the GPU for `fence` to
+    /// reach `value` (a queue on the same device): the recorded work runs
+    /// after that queue's, and the CPU is not involved in between.
+    fn end_and_arm_after(&self, fence: &ID3D12Fence, value: u64) -> windows::core::Result<Option<isize>> {
+        unsafe {
+            self.list.Close()?;
+            self.queue.Wait(fence, value)?;
+            self.queue
+                .ExecuteCommandLists(&[Some(self.list.cast::<ID3D12CommandList>()?)]);
+        }
+        self.signal_and_arm_after_execute()
+    }
+
     /// Attach a private completion marker to work that has already been sent.
     ///
     /// This is the recovery fence for an asynchronous copy whose shared-fence
@@ -2415,6 +2428,19 @@ pub struct TensorTransfer {
     source: String,
     destination: String,
     destination_is_software: bool,
+    src_device: ID3D12Device,
+    /// `set_probe`: parts of the output copied to the CPU with every transfer.
+    probe: std::cell::RefCell<Option<Probe>>,
+}
+
+/// Byte ranges of the converter's output that each transfer also copies into
+/// a readback buffer on the source device, back to back: a few rows the CPU
+/// can compare without touching the destination adapter.
+struct Probe {
+    readback: ID3D12Resource,
+    /// (offset in the output, length), in copy order.
+    ranges: Vec<(u64, u64)>,
+    total: u64,
 }
 
 impl TensorTransfer {
@@ -2533,6 +2559,8 @@ impl TensorTransfer {
             source: source_desc,
             destination: dest.description.clone(),
             destination_is_software: dest.is_software,
+            src_device,
+            probe: std::cell::RefCell::new(None),
         })
     }
 
@@ -2548,6 +2576,80 @@ impl TensorTransfer {
         &self,
         converter: &crate::converter12::Converter12,
     ) -> windows::core::Result<Option<isize>> {
+        self.record(converter)?;
+        self.src.end_and_arm()
+    }
+
+    /// `transfer_submit` after `Converter12::process_submit_unarmed`: the copy
+    /// queue waits on the GPU for the converter's last signal, so the CPU
+    /// waits once -- for this copy -- instead of once for the dispatch and
+    /// again for the copy. Both queues are on the source device.
+    pub fn transfer_submit_after(
+        &self,
+        converter: &crate::converter12::Converter12,
+    ) -> windows::core::Result<Option<isize>> {
+        self.record(converter)?;
+        let (fence, value) = converter.fence();
+        self.src.end_and_arm_after(fence, value)
+    }
+
+    /// Copy also these byte ranges of the converter's output, back to back,
+    /// into a CPU-readable buffer with every transfer (`probe_bytes` after the
+    /// wait). Empty turns it off. Cheap where the source is an integrated GPU:
+    /// the readback buffer is system memory, as its own memory is.
+    pub fn set_probe(&self, ranges: &[(u64, u64)]) -> windows::core::Result<()> {
+        if ranges.is_empty() {
+            *self.probe.borrow_mut() = None;
+            return Ok(());
+        }
+        let mut total = 0u64;
+        for &(offset, length) in ranges {
+            if length == 0 || offset.checked_add(length).is_none_or(|end| end > self.size_bytes) {
+                return Err(windows::core::Error::new(
+                    windows::Win32::Foundation::E_INVALIDARG,
+                    format!(
+                        "probe range {offset}+{length} is empty or outside the {} byte output",
+                        self.size_bytes
+                    ),
+                ));
+            }
+            total += length;
+        }
+        let readback = make_readback_buffer(&self.src_device, total)?;
+        *self.probe.borrow_mut() = Some(Probe {
+            readback,
+            ranges: ranges.to_vec(),
+            total,
+        });
+        Ok(())
+    }
+
+    /// The probe ranges of the last finished transfer, back to back; empty
+    /// without `set_probe`. Read only after the transfer's wait.
+    pub fn probe_bytes(&self) -> windows::core::Result<Vec<u8>> {
+        let probe = self.probe.borrow();
+        let Some(probe) = probe.as_ref() else {
+            return Ok(Vec::new());
+        };
+        let mut out = vec![0u8; probe.total as usize];
+        unsafe {
+            let mut mapped: *mut std::ffi::c_void = std::ptr::null_mut();
+            probe.readback.Map(
+                0,
+                Some(&D3D12_RANGE {
+                    Begin: 0,
+                    End: probe.total as usize,
+                }),
+                Some(&mut mapped),
+            )?;
+            std::ptr::copy_nonoverlapping(mapped as *const u8, out.as_mut_ptr(), out.len());
+            probe.readback.Unmap(0, Some(&D3D12_RANGE { Begin: 0, End: 0 }));
+        }
+        Ok(out)
+    }
+
+    /// Record the copy (and the probe ranges) into the source list.
+    fn record(&self, converter: &crate::converter12::Converter12) -> windows::core::Result<()> {
         if converter.output_byte_size() != self.size_bytes {
             return Err(windows::core::Error::new(
                 windows::Win32::Foundation::E_INVALIDARG,
@@ -2561,9 +2663,16 @@ impl TensorTransfer {
         }
         let list = self.src.begin()?;
         unsafe {
-            list.CopyBufferRegion(&self.shared_src, 0, converter.output(), 0, self.size_bytes)
-        };
-        self.src.end_and_arm()
+            list.CopyBufferRegion(&self.shared_src, 0, converter.output(), 0, self.size_bytes);
+            if let Some(probe) = self.probe.borrow().as_ref() {
+                let mut at = 0u64;
+                for &(offset, length) in &probe.ranges {
+                    list.CopyBufferRegion(&probe.readback, at, converter.output(), offset, length);
+                    at += length;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Read the destination-side buffer back to the CPU. Verification only: it

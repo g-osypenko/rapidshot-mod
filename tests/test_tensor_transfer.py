@@ -197,3 +197,79 @@ def test_transfer_releases_the_gil_while_it_waits(transfer_pair, live_frame, gil
     assert progressed > 0, (
         "another Python thread made no progress across five transfer() calls; "
         "the copy wait is holding the GIL")
+
+
+# --------------------------------------------------------------------------
+# one CPU wait: the copy ordered behind the dispatch on the GPU; the probe
+# --------------------------------------------------------------------------
+
+
+def _two_regions(frame):
+    """Two regions of the frame, so consecutive outputs differ: a copy that ran
+    before its dispatch would carry the other region's output."""
+    width, height = min(frame.width, 4 * OUT), min(frame.height, 4 * OUT)
+    return [(0, 0, width // 2, height // 2), (width // 2, height // 2, width, height)]
+
+
+def _bytes(array):
+    return np.ascontiguousarray(array).view(np.uint8).ravel()
+
+
+def _outputs(converter, frame, regions):
+    outputs = [_bytes(converter.process(frame, region).numpy()).copy() for region in regions]
+    if np.array_equal(outputs[0], outputs[1]):
+        pytest.skip("both regions convert to the same tensor; ordering would not show")
+    return outputs
+
+
+def test_gpu_ordered_transfer_carries_its_own_dispatch(transfer_pair, live_frame):
+    """``process(wait=False)`` + ``transfer(gpu_ordered=True)``: the CPU waits
+    once, and what arrives is still the dispatch just submitted, every time."""
+    converter, transfer = transfer_pair
+    regions = _two_regions(live_frame)
+    expected = _outputs(converter, live_frame, regions)
+    for i in range(20):
+        converter.process(live_frame, regions[i % 2], wait=False)
+        transfer.transfer(gpu_ordered=True)
+        arrived = _bytes(transfer.read_back_destination())
+        assert np.array_equal(arrived, expected[i % 2]), f"transfer {i} carried the wrong output"
+
+
+def test_an_unwaited_dispatch_is_waited_for_by_the_next(transfer_pair, live_frame):
+    """A ``wait=False`` dispatch nobody waited for (its transfer failed, say)
+    must not be overwritten while it runs: the next ``process`` waits first."""
+    converter, _ = transfer_pair
+    regions = _two_regions(live_frame)
+    expected = _outputs(converter, live_frame, regions)
+    converter.process(live_frame, regions[0], wait=False)
+    got = _bytes(converter.process(live_frame, regions[1]).numpy())
+    assert np.array_equal(got, expected[1])
+
+
+@pytest.mark.parametrize("gpu_ordered", [False, True])
+def test_probe_is_the_requested_bytes_of_this_transfer(transfer_pair, live_frame, gpu_ordered):
+    converter, transfer = transfer_pair
+    size = transfer.total_bytes
+    ranges = [(0, 8), (size // 2, 128), (size - 16, 16)]
+    regions = _two_regions(live_frame)
+    _outputs(converter, live_frame, regions)
+    transfer.set_probe(ranges)
+    try:
+        for i in range(6):
+            converter.process(live_frame, regions[i % 2], wait=not gpu_ordered)
+            transfer.transfer(gpu_ordered=gpu_ordered)
+            arrived = _bytes(transfer.read_back_destination())
+            expected = b"".join(arrived[offset:offset + length].tobytes() for offset, length in ranges)
+            assert transfer.probe() == expected, f"transfer {i}"
+    finally:
+        transfer.set_probe([])
+    assert transfer.probe() == b""
+
+
+def test_a_probe_outside_the_output_is_refused(transfer_pair):
+    _, transfer = transfer_pair
+    with pytest.raises(ValueError):
+        transfer.set_probe([(transfer.total_bytes - 4, 8)])
+    with pytest.raises(ValueError):
+        transfer.set_probe([(0, 0)])
+    assert transfer.probe() == b""
