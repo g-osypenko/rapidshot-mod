@@ -273,3 +273,60 @@ def test_a_probe_outside_the_output_is_refused(transfer_pair):
     with pytest.raises(ValueError):
         transfer.set_probe([(0, 0)])
     assert transfer.probe() == b""
+
+
+# --------------------------------------------------------------------------
+# set_wait_tail: asleep until shortly before the expected end, then polling
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("gpu_ordered", [False, True])
+def test_tail_wait_returns_only_after_its_copy(transfer_pair, live_frame, gpu_ordered):
+    """Every way a tail wait can end -- polling from the start (no estimate
+    yet), the timer then polling, an early completion, the polling cap -- and
+    the copy that arrives is still this frame's."""
+    converter, transfer = transfer_pair
+    regions = _two_regions(live_frame)
+    expected = _outputs(converter, live_frame, regions)
+    count = 30
+    for tail_us, max_poll_us in ((300.0, 1500.0), (1e6, 1500.0), (300.0, 0.0)):
+        transfer.set_wait_tail(tail_us, max_poll_us)
+        try:
+            before = transfer.wait_tail_stats()
+            for i in range(count):
+                converter.process(live_frame, regions[i % 2], wait=not gpu_ordered)
+                transfer.transfer(gpu_ordered=gpu_ordered)
+                arrived = _bytes(transfer.read_back_destination())
+                assert np.array_equal(arrived, expected[i % 2]), f"tail {tail_us}: transfer {i}"
+            stats = transfer.wait_tail_stats()
+            assert sum(stats[:4]) - sum(before[:4]) == count, stats
+        finally:
+            transfer.set_wait_tail(0)
+    assert transfer.wait_tail_stats() == (0, 0, 0, 0, 0.0, 0.0)
+
+
+def test_switching_the_tail_on_and_off_leaves_no_stale_wake(transfer_pair, live_frame):
+    """The tail wait arms an event of its own, so the transfer's event is never
+    left signalled: a plain wait after tail waits still waits for its copy."""
+    converter, transfer = transfer_pair
+    regions = _two_regions(live_frame)
+    expected = _outputs(converter, live_frame, regions)
+    try:
+        for i in range(40):
+            transfer.set_wait_tail(300.0 if i % 3 else 0.0)
+            converter.process(live_frame, regions[i % 2], wait=False)
+            transfer.transfer(gpu_ordered=True)
+            assert np.array_equal(_bytes(transfer.read_back_destination()), expected[i % 2]), f"transfer {i}"
+    finally:
+        transfer.set_wait_tail(0)
+
+
+def test_tail_wait_releases_the_gil(transfer_pair, live_frame, gil_progress):
+    converter, transfer = transfer_pair
+    transfer.set_wait_tail(300.0)
+    try:
+        converter.process(live_frame)
+        progressed = gil_progress(transfer.transfer)
+    finally:
+        transfer.set_wait_tail(0)
+    assert progressed > 0, "another Python thread made no progress across five tail-mode transfers"

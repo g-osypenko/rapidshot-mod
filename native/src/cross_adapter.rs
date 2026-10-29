@@ -30,7 +30,7 @@ use pyo3::types::{PyDict, PyList};
 use std::cell::Cell;
 
 use windows::core::Interface;
-use windows::Win32::Foundation::{CloseHandle, HANDLE};
+use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
 use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
 use windows::Win32::Graphics::Direct3D11::{ID3D11Device, ID3D11Texture2D, D3D11_TEXTURE2D_DESC};
 use windows::Win32::Graphics::Direct3D12::*;
@@ -43,7 +43,12 @@ use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory1, IDXGIAdapter, IDXGIAdapter1, IDXGIDevice, IDXGIFactory1, IDXGIResource1,
     DXGI_ADAPTER_DESC1, DXGI_ADAPTER_FLAG_SOFTWARE, DXGI_ERROR_NOT_FOUND,
 };
-use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject, INFINITE};
+use windows::Win32::System::Threading::{
+    CreateEventW, CreateWaitableTimerExW, SetWaitableTimer, WaitForMultipleObjects, WaitForSingleObject,
+    CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, INFINITE, TIMER_ALL_ACCESS,
+};
+
+use crate::converter12::{qpc_frequency, qpc_now};
 
 /// Generic access rights for a shared heap handle.
 const GENERIC_ALL: u32 = 0x1000_0000;
@@ -734,13 +739,31 @@ impl Submitter {
     /// reach `value` (a queue on the same device): the recorded work runs
     /// after that queue's, and the CPU is not involved in between.
     fn end_and_arm_after(&self, fence: &ID3D12Fence, value: u64) -> windows::core::Result<Option<isize>> {
+        self.execute(Some((fence, value)))?;
+        self.signal_and_arm_after_execute()
+    }
+
+    /// Submit what was recorded and signal, without arming `event`: the value
+    /// the fence reaches once the work is done, for a caller that waits its
+    /// own way (`TailWait`). `after` as for `end_and_arm_after`.
+    fn end_and_signal(&self, after: Option<(&ID3D12Fence, u64)>) -> windows::core::Result<u64> {
+        self.execute(after)?;
+        let value = self.value.get() + 1;
+        unsafe { self.queue.Signal(&self.fence, value)? };
+        self.value.set(value);
+        Ok(value)
+    }
+
+    fn execute(&self, after: Option<(&ID3D12Fence, u64)>) -> windows::core::Result<()> {
         unsafe {
             self.list.Close()?;
-            self.queue.Wait(fence, value)?;
+            if let Some((fence, value)) = after {
+                self.queue.Wait(fence, value)?;
+            }
             self.queue
                 .ExecuteCommandLists(&[Some(self.list.cast::<ID3D12CommandList>()?)]);
         }
-        self.signal_and_arm_after_execute()
+        Ok(())
     }
 
     /// Attach a private completion marker to work that has already been sent.
@@ -2431,6 +2454,17 @@ pub struct TensorTransfer {
     src_device: ID3D12Device,
     /// `set_probe`: parts of the output copied to the CPU with every transfer.
     probe: std::cell::RefCell<Option<Probe>>,
+    /// `set_wait_tail`: how the CPU waits for each copy; `None` - asleep on
+    /// the event until the end.
+    tail: std::cell::RefCell<Option<TailState>>,
+}
+
+/// How to wait for a submitted copy (`TensorTransfer::submit`).
+pub enum Pending {
+    /// The armed event (`crate::wait_armed`), or `None` if already done.
+    Event(Option<isize>),
+    /// `TailWait::wait`, then `TensorTransfer::tail_done` with its result.
+    Tail(TailWait),
 }
 
 /// Byte ranges of the converter's output that each transfer also copies into
@@ -2441,6 +2475,111 @@ struct Probe {
     /// (offset in the output, length), in copy order.
     ranges: Vec<(u64, u64)>,
     total: u64,
+}
+
+/// How a `TailWait` ended: the copy was already done, an early completion
+/// woke the sleep (as without the tail), polling saw it, or polling ran out
+/// and the wait went back to sleep.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TailEnd {
+    Done = 0,
+    Event = 1,
+    Polled = 2,
+    Fallback = 3,
+}
+
+/// The CPU's wait for a copy in `TensorTransfer::set_wait_tail` mode: asleep
+/// until shortly before the expected end, then polling the fence, which the
+/// GPU writes to memory -- no interrupt, no thread to wake. Never later than
+/// a plain wait: the sleep also ends on the fence's own event.
+///
+/// Plain data, so the Python binding can run it with the GIL released
+/// (`py.detach` needs `Send`): the fence crosses as a raw pointer, alive
+/// because the `TensorTransfer` whose method is running holds it and, being
+/// `unsendable`, can be neither dropped nor used elsewhere meanwhile -- the
+/// argument the raw event handles rest on.
+pub struct TailWait {
+    fence: usize,
+    value: u64,
+    /// QPC to sleep until; at or before the start of the wait: poll at once.
+    wake_qpc: i64,
+    /// Longest polling, in QPC ticks, before sleeping on the event instead.
+    max_poll_qpc: i64,
+}
+
+impl TailWait {
+    /// Wait; the QPC at which the copy was seen complete, how, and the QPC
+    /// ticks spent polling.
+    pub fn wait(&self) -> (i64, TailEnd, i64) {
+        let raw = self.fence as *mut core::ffi::c_void;
+        let fence = unsafe { ID3D12Fence::from_raw_borrowed(&raw) }.expect("the transfer's fence");
+        let complete = || unsafe { fence.GetCompletedValue() } >= self.value;
+        if complete() {
+            return (qpc_now(), TailEnd::Done, 0);
+        }
+        // An event of its own, not the submitter's: once polling wins, the
+        // kernel still signals it, maybe later, and that must not end some
+        // future wait early. Closing our handle to it is safe whenever.
+        let armed = unsafe { CreateEventW(None, false, false, None) }
+            .map(OwnedHandle)
+            .and_then(|event| unsafe { fence.SetEventOnCompletion(self.value, event.0) }.map(|_| event));
+        let Ok(event) = armed else {
+            let start = qpc_now();
+            while !complete() {
+                std::thread::yield_now();
+            }
+            let now = qpc_now();
+            return (now, TailEnd::Polled, now - start);
+        };
+        let now = qpc_now();
+        if self.wake_qpc > now {
+            let slept = unsafe {
+                CreateWaitableTimerExW(None, None, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS.0)
+            }
+            .map(OwnedHandle)
+            .ok()
+            .and_then(|timer| {
+                // Negative: relative, in 100 ns units.
+                let due = -(((self.wake_qpc - now) as i128 * 10_000_000) / qpc_frequency() as i128) as i64;
+                unsafe { SetWaitableTimer(timer.0, &due, 0, None, None, false) }.ok()?;
+                Some(unsafe { WaitForMultipleObjects(&[event.0, timer.0], false, INFINITE) })
+            });
+            match slept {
+                Some(woke) if woke == WAIT_OBJECT_0 => return (qpc_now(), TailEnd::Event, 0),
+                Some(_) => {}
+                // No timer: sleep as without the tail.
+                None => {
+                    unsafe { WaitForSingleObject(event.0, INFINITE) };
+                    return (qpc_now(), TailEnd::Event, 0);
+                }
+            }
+        }
+        let start = qpc_now();
+        let give_up = start + self.max_poll_qpc;
+        while !complete() {
+            if qpc_now() > give_up {
+                unsafe { WaitForSingleObject(event.0, INFINITE) };
+                return (qpc_now(), TailEnd::Fallback, give_up - start);
+            }
+            std::hint::spin_loop();
+        }
+        let now = qpc_now();
+        (now, TailEnd::Polled, now - start)
+    }
+}
+
+/// `set_wait_tail` state: the tail and the polling cap, the expected copy
+/// duration from submission, and how the waits went.
+#[derive(Default)]
+struct TailState {
+    tail_us: f64,
+    max_poll_us: f64,
+    /// Expected submission-to-completion time; 0 until the first wait.
+    estimate_us: f64,
+    submit_qpc: i64,
+    /// Per `TailEnd`, and the polling time, in QPC ticks.
+    ends: [u64; 4],
+    polled_qpc: i64,
 }
 
 impl TensorTransfer {
@@ -2561,36 +2700,96 @@ impl TensorTransfer {
             destination_is_software: dest.is_software,
             src_device,
             probe: std::cell::RefCell::new(None),
+            tail: std::cell::RefCell::new(None),
         })
     }
 
-    /// Copy the converter's current output across: submit the copy and return
-    /// the event to wait on (`Submitter::end_and_arm`). The tensor is readable
-    /// on the destination adapter once that wait is over; the Python binding
-    /// releases the GIL for it.
+    /// Wait for each copy asleep until `tail_us` before its expected end, then
+    /// poll the fence for at most `max_poll_us` (`TailWait`): a woken thread
+    /// costs about half a millisecond on a laptop iGPU, polling about the time
+    /// it polls. 0 turns it off -- asleep on the event until the end, as by
+    /// default.
+    pub fn set_wait_tail(&self, tail_us: f64, max_poll_us: f64) {
+        *self.tail.borrow_mut() = (tail_us > 0.0).then(|| TailState {
+            tail_us,
+            max_poll_us: max_poll_us.max(0.0),
+            ..TailState::default()
+        });
+    }
+
+    /// Copy the converter's current output across: submit the copy and say how
+    /// to wait for it. The tensor is readable on the destination adapter once
+    /// that wait is over; the Python binding releases the GIL for it.
     ///
     /// The caller is responsible for having run `process()` first: this copies
     /// whatever is in the buffer, and a buffer that was never written is zeros
-    /// rather than an error.
-    pub fn transfer_submit(
+    /// rather than an error. `gpu_ordered` after
+    /// `Converter12::process_submit_unarmed`: the copy queue waits on the GPU
+    /// for the converter's last signal, so the CPU waits once -- for this copy
+    /// -- instead of once for the dispatch and again for the copy. Both queues
+    /// are on the source device.
+    pub fn submit(
         &self,
         converter: &crate::converter12::Converter12,
-    ) -> windows::core::Result<Option<isize>> {
+        gpu_ordered: bool,
+    ) -> windows::core::Result<Pending> {
         self.record(converter)?;
-        self.src.end_and_arm()
+        let after = if gpu_ordered { Some(converter.fence()) } else { None };
+        let mut tail = self.tail.borrow_mut();
+        let Some(state) = tail.as_mut() else {
+            return Ok(Pending::Event(match after {
+                Some((fence, value)) => self.src.end_and_arm_after(fence, value)?,
+                None => self.src.end_and_arm()?,
+            }));
+        };
+        let value = self.src.end_and_signal(after)?;
+        let now = qpc_now();
+        state.submit_qpc = now;
+        let ticks_per_us = qpc_frequency() as f64 / 1e6;
+        Ok(Pending::Tail(TailWait {
+            fence: self.src.fence.as_raw() as usize,
+            value,
+            wake_qpc: now + ((state.estimate_us - state.tail_us).max(0.0) * ticks_per_us) as i64,
+            max_poll_qpc: (state.max_poll_us * ticks_per_us) as i64,
+        }))
     }
 
-    /// `transfer_submit` after `Converter12::process_submit_unarmed`: the copy
-    /// queue waits on the GPU for the converter's last signal, so the CPU
-    /// waits once -- for this copy -- instead of once for the dispatch and
-    /// again for the copy. Both queues are on the source device.
-    pub fn transfer_submit_after(
-        &self,
-        converter: &crate::converter12::Converter12,
-    ) -> windows::core::Result<Option<isize>> {
-        self.record(converter)?;
-        let (fence, value) = converter.fence();
-        self.src.end_and_arm_after(fence, value)
+    /// After a `TailWait`: learn the copy's duration from how the wait ended
+    /// and count it. Polling saw the true end; an early event only says the
+    /// estimate is late, so it moves earlier by a little -- learning from the
+    /// event's own time would add the wake-up the tail exists to avoid, and
+    /// the estimate would drift late until polling never ran.
+    pub fn tail_done(&self, (done_qpc, end, polled_qpc): (i64, TailEnd, i64)) {
+        let mut tail = self.tail.borrow_mut();
+        let Some(state) = tail.as_mut() else {
+            return;
+        };
+        let took_us = (done_qpc - state.submit_qpc) as f64 * 1e6 / qpc_frequency() as f64;
+        state.estimate_us = match end {
+            _ if state.estimate_us == 0.0 => took_us,
+            TailEnd::Done => state.estimate_us.min(took_us),
+            TailEnd::Event => state.estimate_us * 0.97,
+            TailEnd::Polled | TailEnd::Fallback => 0.9 * state.estimate_us + 0.1 * took_us,
+        };
+        state.ends[end as usize] += 1;
+        state.polled_qpc += polled_qpc;
+    }
+
+    /// Tail-mode waits so far: (already done, woken by the event, seen by
+    /// polling, polling ran out, milliseconds spent polling, the current
+    /// estimate in microseconds). Zeros outside tail mode.
+    pub fn tail_stats(&self) -> (u64, u64, u64, u64, f64, f64) {
+        match self.tail.borrow().as_ref() {
+            None => (0, 0, 0, 0, 0.0, 0.0),
+            Some(s) => (
+                s.ends[0],
+                s.ends[1],
+                s.ends[2],
+                s.ends[3],
+                s.polled_qpc as f64 * 1e3 / qpc_frequency() as f64,
+                s.estimate_us,
+            ),
+        }
     }
 
     /// Copy also these byte ranges of the converter's output, back to back,

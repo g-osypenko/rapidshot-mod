@@ -645,7 +645,7 @@ impl TensorTransfer {
     /// waits for that dispatch on the GPU, and this is the only CPU wait.
     #[pyo3(signature = (converter, *, gpu_ordered=false))]
     fn transfer(&self, py: Python<'_>, converter: &GpuConverter12, gpu_ordered: bool) -> PyResult<()> {
-        let event = {
+        let pending = {
             let inner = self
                 .inner
                 .lock()
@@ -654,15 +654,44 @@ impl TensorTransfer {
                 .inner
                 .lock()
                 .map_err(|_| PyRuntimeError::new_err("converter lock poisoned"))?;
-            if gpu_ordered {
-                inner.transfer_submit_after(&source)
-            } else {
-                inner.transfer_submit(&source)
-            }
-            .map_err(|e| PyRuntimeError::new_err(format!("tensor transfer failed: {e}")))?
+            inner
+                .submit(&source, gpu_ordered)
+                .map_err(|e| PyRuntimeError::new_err(format!("tensor transfer failed: {e}")))?
         };
-        wait_armed_detached(py, event);
+        match pending {
+            cross_adapter::Pending::Event(event) => wait_armed_detached(py, event),
+            cross_adapter::Pending::Tail(wait) => {
+                let ended = py.detach(move || wait.wait());
+                self.inner
+                    .lock()
+                    .map_err(|_| PyRuntimeError::new_err("transfer lock poisoned"))?
+                    .tail_done(ended);
+            }
+        }
         Ok(())
+    }
+
+    /// Wait for each copy asleep until `tail_us` microseconds before its
+    /// expected end, then poll the fence for at most `max_poll_us`; the sleep
+    /// also ends on the copy's completion, so never later than without it.
+    /// `0` - asleep until the end (the default).
+    #[pyo3(signature = (tail_us, max_poll_us=1500.0))]
+    fn set_wait_tail(&self, tail_us: f64, max_poll_us: f64) -> PyResult<()> {
+        self.inner
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("transfer lock poisoned"))?
+            .set_wait_tail(tail_us, max_poll_us);
+        Ok(())
+    }
+
+    /// `set_wait_tail` waits so far: (already done, woken by the event, seen
+    /// by polling, polling ran out, ms spent polling, expected duration in us).
+    fn wait_tail_stats(&self) -> PyResult<(u64, u64, u64, u64, f64, f64)> {
+        Ok(self
+            .inner
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("transfer lock poisoned"))?
+            .tail_stats())
     }
 
     /// With every transfer, also copy these `(offset, length)` byte ranges of

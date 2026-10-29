@@ -587,6 +587,22 @@ class TensorTransfer:
         them; ``b""`` without a probe."""
         return bytes(self._impl.probe())
 
+    def set_wait_tail(self, tail_us: float, max_poll_us: float = 1500.0) -> None:
+        """How :meth:`transfer` waits: asleep until ``tail_us`` microseconds
+        before the copy's expected end (learnt from earlier copies), then
+        polling the fence for at most ``max_poll_us``. Waking a sleeping
+        thread costs about half a millisecond on a laptop iGPU; polling costs
+        a CPU core for as long as it polls. The sleep also ends on the copy's
+        completion, so a wait is never later than without the tail. ``0``
+        (the default) sleeps until the end."""
+        self._impl.set_wait_tail(float(tail_us), float(max_poll_us))
+
+    def wait_tail_stats(self) -> Tuple[int, int, int, int, float, float]:
+        """:meth:`set_wait_tail` waits so far: (already done, woken by the
+        completion, seen by polling, polling ran out, milliseconds spent
+        polling, expected copy duration in microseconds)."""
+        return tuple(self._impl.wait_tail_stats())
+
     def read_back_destination(self):
         """Destination-side bytes as a NumPy array. **Verification only.**"""
         return self._converter._slots(self._impl.read_back_destination())

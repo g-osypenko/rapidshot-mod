@@ -740,7 +740,7 @@ struct Timing {
     submit_qpc: std::cell::Cell<i64>,
 }
 
-fn qpc_now() -> i64 {
+pub(crate) fn qpc_now() -> i64 {
     let mut value = 0i64;
     unsafe {
         let _ = windows::Win32::System::Performance::QueryPerformanceCounter(&mut value);
@@ -748,7 +748,7 @@ fn qpc_now() -> i64 {
     value
 }
 
-fn qpc_frequency() -> i64 {
+pub(crate) fn qpc_frequency() -> i64 {
     let mut value = 0i64;
     unsafe {
         let _ = windows::Win32::System::Performance::QueryPerformanceFrequency(&mut value);
@@ -1215,7 +1215,7 @@ impl Converter12 {
     /// `process_submit` without arming the event: the dispatch is submitted,
     /// the fence signalled, and the value it reaches once the output is
     /// complete returned. For a consumer on this device that orders its own
-    /// queue behind it (`TensorTransfer::transfer_submit_after`), so the CPU
+    /// queue behind it (`TensorTransfer::submit`, `gpu_ordered`), so the CPU
     /// waits once, for the consumer. Nothing is left to wait on here: if no
     /// one waited, the next dispatch does (`record_and_execute`).
     pub fn process_submit_unarmed(
