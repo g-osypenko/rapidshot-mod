@@ -259,6 +259,58 @@ def test_float16_matches_float32_within_half_precision(live_frame):
     np.testing.assert_allclose(f16.astype(np.float32), f32, atol=1e-3)
 
 
+@pytest.mark.parametrize("layout", ["nchw", "nhwc"])
+@pytest.mark.parametrize(
+    "scale, bias",
+    [
+        (1.0, 0.0),  # the default 0..1
+        (255.0, 0.0),  # normalize=False
+        (1e-4, 0.0),  # half subnormals below 2^-14, and the boundary
+        (3e-8, 0.0),  # around 2^-25: zero, the tie, the smallest subnormal
+        (70000.0, 0.0),  # past 65504: overflow to Inf, and the 65520 boundary
+        (-1.0, 0.0),  # negative
+        (2.0, -1.0),  # -1..1 through zero
+    ],
+)
+def test_float16_is_float32_rounded_to_nearest_even(live_frame, layout, scale, bias):
+    """FP16 is the FP32 output rounded to nearest even, bit for bit.
+
+    That is what every consumer's own cast does (CUDA, numpy, TensorRT's input
+    cast), so a float16 tensor gives a float16 model exactly the input a
+    float32 one would. HLSL's f32tof16 does not promise it: on NVIDIA it
+    truncates. Area sampling from a region larger than the output, so the
+    values are weighted means -- the ones that are not representable in half.
+    """
+    frame = live_frame
+    size = (96, 64)
+    crop = (0, 0, min(frame.width, 150), min(frame.height, 100))
+    outputs = {}
+    for dtype in ("float32", "float16"):
+        converter = rapidshot.GpuConverter(
+            frame, size, dtype=dtype, layout=layout, sampling="area", crop=crop
+        )
+        converter._impl.process(
+            native._texture_address(frame),
+            scale,
+            bias,
+            False,
+            source_id=getattr(frame, "source_id", 0),
+            crop=native._texture_crop(frame, crop),
+        )
+        outputs[dtype] = converter._tensor.numpy().copy()
+        converter.close()
+    f32, f16 = outputs["float32"], outputs["float16"]
+    with np.errstate(over="ignore"):  # the 70000 case overflows on purpose
+        expected = f32.astype(np.float16)
+    assert f16.dtype == np.float16 and f16.shape == expected.shape
+    wrong = np.flatnonzero(f16.view(np.uint16) != expected.view(np.uint16))
+    assert wrong.size == 0, (
+        f"{wrong.size} of {f16.size} halves not rounded to nearest even, e.g. "
+        f"{f32.ravel()[wrong[0]]!r} -> {f16.ravel()[wrong[0]]!r}, "
+        f"expected {expected.ravel()[wrong[0]]!r}"
+    )
+
+
 def test_float16_halves_the_payload(live_frame):
     """The entire point of FP16 on this path is bytes on the bus (§ 6.1)."""
     f32 = rapidshot.GpuConverter(live_frame, (OUT, OUT), dtype="float32")

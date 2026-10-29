@@ -345,6 +345,45 @@ float3 shade(float4 texel)
     return float3(c0, c1, c2) * Scale + Bias;
 }
 
+// float32 -> float16 bits, rounded to nearest even. f32tof16 rounds however
+// the driver likes -- NVIDIA truncates, one ulp low in about half of all
+// values -- so a float16 tensor would differ from the same float32 tensor
+// cast on the consumer side, which rounds to nearest even everywhere (CUDA,
+// TensorRT's input cast, numpy). Subnormals, overflow to Inf and NaN included.
+uint f32_to_f16(float value)
+{
+    uint x = asuint(value);
+    uint sign = (x >> 16) & 0x8000u;
+    uint a = x & 0x7FFFFFFFu;
+    if (a >= 0x7F800000u)                 // Inf, NaN (quiet; payload dropped)
+        return sign | (a > 0x7F800000u ? 0x7E00u : 0x7C00u);
+    if (a >= 0x477FF000u)                 // 65520 and up rounds past 65504
+        return sign | 0x7C00u;
+    uint h;
+    uint rem;
+    uint tie;
+    if (a < 0x38800000u)                  // below 2^-14: a half subnormal
+    {
+        if (a < 0x33000000u)              // below 2^-25: rounds to zero
+            return sign;
+        uint shift = 126u - (a >> 23);    // 14..24
+        uint m = (a & 0x007FFFFFu) | 0x00800000u;
+        h = m >> shift;
+        rem = m & ((1u << shift) - 1u);
+        tie = 1u << (shift - 1u);
+    }
+    else
+    {
+        h = (a - 0x38000000u) >> 13;      // exponent bias 127 -> 15
+        rem = a & 0x1FFFu;
+        tie = 0x1000u;
+    }
+    // A carry out of the mantissa is the next exponent, as it should be.
+    if (rem > tie || (rem == tie && (h & 1u) != 0u))
+        h += 1u;
+    return sign | h;
+}
+
 #if OUTPUT == 1
 // FP16 NCHW. Two horizontally adjacent output pixels per thread, because a
 // ByteAddressBuffer stores 32 bits at a time and a half is 16. OutWidth is
@@ -366,7 +405,7 @@ void CSMain(uint3 tid : SV_DispatchThreadID)
 
     [unroll] for (uint c = 0; c < 3; ++c)
     {
-        uint packed = (f32tof16(b[c]) << 16) | f32tof16(a[c]);
+        uint packed = (f32_to_f16(b[c]) << 16) | f32_to_f16(a[c]);
         Output.Store(((tid.z * 3 + c) * plane + idx) * 2, packed);
     }
 }
@@ -405,9 +444,9 @@ void CSMain(uint3 tid : SV_DispatchThreadID)
     float3 b = shade(fetch(x0 + 1, tid.y));
 
     uint base = ((tid.z * OutHeight + tid.y) * OutWidth + x0) * 6;
-    Output.Store(base,     f32tof16(a.x) | (f32tof16(a.y) << 16));
-    Output.Store(base + 4, f32tof16(a.z) | (f32tof16(b.x) << 16));
-    Output.Store(base + 8, f32tof16(b.y) | (f32tof16(b.z) << 16));
+    Output.Store(base,     f32_to_f16(a.x) | (f32_to_f16(a.y) << 16));
+    Output.Store(base + 4, f32_to_f16(a.z) | (f32_to_f16(b.x) << 16));
+    Output.Store(base + 8, f32_to_f16(b.y) | (f32_to_f16(b.z) << 16));
 }
 
 #elif OUTPUT == 2
